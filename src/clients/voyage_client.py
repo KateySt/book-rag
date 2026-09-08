@@ -31,7 +31,3 @@ async def rerank(query: str, documents: list[str], top_k: int) -> list[tuple[int
         top_k=top_k,
     )
     return [(item.index, item.relevance_score) for item in result.results]
-
-
-def get_token_counts(texts: list[str]) -> list[int]:
-    return [len(tokens) for tokens in voyageai_client.tokenize(texts, model=VOYAGE_MODEL)]

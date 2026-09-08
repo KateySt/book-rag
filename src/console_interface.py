@@ -1,25 +1,21 @@
 from cyclopts import App
 from pathlib import Path
 
-from src.chunking import chunk_blocks
-from src.parsing import parse_pdf, load_blocks
+from src.langchain_pipeline import load_and_chunk
 from src.services.rag_service import add_texts, ask, search
 
 app = App()
 
 
 @app.command(name="index-pdf")
-async def index_pdf_command(
+async def index_pdf_langchain_command(
         file: Path,
         book_title: str | None = None,
         target_tokens: int = 512,
-        backend: str = "pipeline",
-        lang: str = "en",
 ):
-    blocks = load_blocks(parse_pdf(file, backend=backend, lang=lang))
-    chunks = chunk_blocks(blocks, target_tokens=target_tokens)
+    chunks = load_and_chunk(file, target_tokens=target_tokens)
     payloads = [{"title": book_title or file.stem, **chunk} for chunk in chunks]
-    ids = await add_texts(payloads)
+    ids = await add_texts(payloads, group_key="doc_group")
     print(f"Added {len(ids)} chunks from {file}")
 
 
