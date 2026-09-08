@@ -1,38 +1,32 @@
 # Books RAG
 
-A retrieval-augmented generation (RAG) pipeline for technical books in PDF form. It parses a PDF
-into structured blocks, chunks them along the book's own section boundaries, indexes them into
-Qdrant with hybrid dense + sparse vectors, and answers questions with Claude over the retrieved
-context.
+A retrieval-augmented generation (RAG) pipeline for technical books in PDF form. It converts a PDF
+into structured, heading-aware chunks with Docling, indexes them into Qdrant with hybrid dense +
+sparse vectors, and answers questions with Claude over the retrieved context.
 
 ## How it works
 
 ```
-PDF ──▶ MinerU parse ──▶ blocks ──▶ section-aware chunking ──▶ Voyage contextual embeddings
-                                                                        │
-                                                                        ▼
+PDF ──▶ Docling parse + hybrid chunking ──▶ Voyage contextual embeddings
+                                                        │
+                                                        ▼
 question ──▶ Voyage query embedding ──▶ Qdrant hybrid search (dense + BM25, RRF)
                                                      │
                                                      ▼
                                           Voyage rerank ──▶ Claude ──▶ answer + sources
 ```
 
-1. **Parsing** (`src/parsing.py`) — [MinerU](https://github.com/opendatalab/MinerU) converts the PDF
-   into a content list. Page furniture (headers, footers, page numbers) and front/back matter
-   (contents, index, acknowledgments, …) are dropped; headings are tracked to build a
-   `section_path` and `chapter` for every block. Parse output is cached under `parsed/`, so
-   re-running a command on the same PDF skips the expensive parse.
-2. **Chunking** (`src/chunking.py`) — blocks are packed up to a token budget and flushed whenever
-   the section changes, so a chunk never spans two sections. Atomic blocks (code, tables,
-   equations) that exceed the budget become chunks of their own instead of being split. Each chunk
-   is prefixed with its section path and carries `chapter`, `page_start`/`page_end`, and
-   `chunk_index` metadata.
-3. **Embedding** (`src/clients/voyage_client.py`) — Voyage *contextualized* embeddings are used, so
-   chunks are embedded as groups (by chapter) and each vector is aware of its neighbours.
-4. **Storage & retrieval** (`src/db/vector_store.py`) — Qdrant holds a `dense` vector and a `bm25`
-   sparse vector per chunk. Search prefetches candidates from both and fuses them with Reciprocal
-   Rank Fusion.
-5. **Reranking & answering** (`src/services/rag_service.py`) — the fused candidates are reranked by
+1. **Parsing & chunking** (`src/langchain_pipeline.py`) — [`DoclingLoader`](https://github.com/docling-project/docling)
+   converts the PDF and emits `HybridChunker` chunks that respect the document's own structure and
+   a token budget. Page furniture (headers, footers, footnotes) is dropped. Each chunk carries its
+   `section_path` (heading trail), `chapter` (top heading), `page_start`/`page_end`, `chunk_index`,
+   a coarse `type` (`code` / `table` / `text`) and a `doc_group` used to batch embeddings.
+2. **Embedding** (`src/clients/voyage_client.py`) — Voyage *contextualized* embeddings are used, so
+   chunks are embedded as groups and each vector is aware of its neighbours in the same group.
+3. **Storage & retrieval** (`src/db/vector_store.py`) — Qdrant holds a `dense` vector and a `bm25`
+   sparse vector (via [fastembed](https://github.com/qdrant/fastembed)) per chunk. Search prefetches
+   candidates from both and fuses them with Reciprocal Rank Fusion.
+4. **Reranking & answering** (`src/services/rag_service.py`) — the fused candidates are reranked by
    Voyage, and the top results are passed to Claude, which is instructed to answer *only* from the
    provided context.
 
@@ -81,12 +75,6 @@ The CLI is built with [cyclopts](https://cyclopts.readthedocs.io/) and exposed t
 uv run python -m src.console_interface <command> [OPTIONS]
 ```
 
-### `list-chapters` — inspect a book before indexing
-
-```bash
-uv run python -m src.console_interface list-chapters src/data/fastapibook.pdf
-```
-
 ### `index-pdf` — parse, chunk and index a book
 
 ```bash
@@ -98,9 +86,7 @@ uv run python -m src.console_interface index-pdf src/data/fastapibook.pdf \
 | Option | Default | Description |
 | --- | --- | --- |
 | `--book-title` | PDF file stem | Stored as `title` on every chunk |
-| `--target-tokens` | `512` | Token budget per chunk |
-| `--backend` | `pipeline` | MinerU backend (`pipeline` or a `vlm*` backend) |
-| `--lang` | `en` | OCR language hint |
+| `--target-tokens` | `512` | `max_tokens` passed to the Docling `HybridChunker` |
 
 The Qdrant collection is created on first index using the embedding dimensionality returned by
 Voyage.
@@ -110,6 +96,8 @@ Voyage.
 ```bash
 uv run python -m src.console_interface search "how do I add dependencies to a route?" --top-k 10
 ```
+
+Retrieves 50 hybrid candidates, reranks them, and prints the top `--top-k`.
 
 ### `ask` — full RAG answer with sources
 
@@ -125,24 +113,22 @@ Aliased as `get_answer`.
 src/
 ├── console_interface.py     # CLI entry point (cyclopts commands)
 ├── settings.py              # Environment configuration
-├── parsing.py               # PDF → structured blocks (MinerU)
-├── chunking.py              # Blocks → section-aware chunks
+├── langchain_pipeline.py    # PDF → chunks (Docling loader + hybrid chunker)
 ├── services/
 │   └── rag_service.py       # Index / search / ask orchestration
 ├── clients/
 │   ├── claude_client.py     # Anthropic answer generation
-│   └── voyage_client.py     # Embeddings, reranking, token counting
+│   └── voyage_client.py     # Embeddings and reranking
 └── db/
     └── vector_store.py      # Qdrant collection, upsert, hybrid search
-docs/                        # Chunking research notes
-parsed/                      # MinerU parse cache (generated)
+parsed/                      # Leftover parse artifacts from the earlier MinerU pipeline
 ```
 
 ## Notes & caveats
 
-- The first MinerU run downloads its models, which takes a while and needs disk space. Subsequent
-  runs on the same PDF reuse the cache in `parsed/`.
-- Chunk token counts come from Voyage's tokenizer, so they match what the embedding model actually
-  sees.
+- The first run downloads the Docling and fastembed models, which takes a while and needs disk
+  space; later runs reuse the local model cache.
+- Chunk sizes are enforced by Docling's tokenizer, not Voyage's, so `--target-tokens` is a guide
+  rather than an exact budget for the embedding model.
 - Re-indexing the same book appends new points (IDs are random UUIDs) rather than replacing the old
-  ones - drop the collection first if you want a clean index.
+  ones — drop the collection first if you want a clean index.
