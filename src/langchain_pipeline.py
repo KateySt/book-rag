@@ -15,7 +15,6 @@ def load_and_chunk(file: Path, target_tokens: int = 512) -> list[dict]:
         export_type=ExportType.DOC_CHUNKS,
         chunker=HybridChunker(
             max_tokens=target_tokens,
-            merge_peers=True,
         ),
     )
 
