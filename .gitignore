@@ -1,6 +1,7 @@
 .env
 .env.*
 *.env
+!.env.example
 config.py
 secrets/
 certs/
@@ -38,3 +39,4 @@ dist/
 .vscode/
 .DS_Store
 poetry.lock
+/parsed/

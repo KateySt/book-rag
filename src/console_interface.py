@@ -1,21 +1,22 @@
 from cyclopts import App
 from pathlib import Path
 
+from src.langchain_pipeline import load_and_chunk
 from src.services.rag_service import add_texts, ask, search
-from src.utils import load_articles
 
 app = App()
 
 
-@app.command(name="index", alias="add_new_texts")
-async def index_command(file: Path, separator: str = "\n\n"):
-    articles = load_articles(file, separator=separator)
-    payloads = [
-        {"title": article.splitlines()[0][:80], "text": article}
-        for article in articles
-    ]
-    ids = await add_texts(payloads)
-    print(f"Added {len(ids)} docs from {file}")
+@app.command(name="index-pdf")
+async def index_pdf_langchain_command(
+        file: Path,
+        book_title: str | None = None,
+        target_tokens: int = 512,
+):
+    chunks = load_and_chunk(file, target_tokens=target_tokens)
+    payloads = [{"title": book_title or file.stem, **chunk} for chunk in chunks]
+    ids = await add_texts(payloads, group_key="doc_group")
+    print(f"Added {len(ids)} chunks from {file}")
 
 
 @app.command(name="search")

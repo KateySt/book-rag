@@ -42,13 +42,13 @@ async def upsert_documents(
     return ids
 
 
-async def search_hybrid(query_text: str, query_vector: list[float], top_k: int = 10) -> list[dict]:
+async def search_hybrid(query_text: str, query_vector: list[float], top_k: int = 10, prefetch_limit: int = 50) -> list[dict]:
     sparse_query = next(bm25_encoder.embed([query_text]))
     result = await qdrant_client.query_points(
         collection_name=QDRANT_COLLECTION,
         prefetch=[
-            models.Prefetch(query=query_vector, using="dense", limit=50),
-            models.Prefetch(query=sparse_query.as_object(), using="bm25", limit=50),
+            models.Prefetch(query=query_vector, using="dense", limit=prefetch_limit),
+            models.Prefetch(query=sparse_query.as_object(), using="bm25", limit=prefetch_limit),
         ],
         query=models.FusionQuery(fusion=models.Fusion.RRF),
         limit=top_k,
