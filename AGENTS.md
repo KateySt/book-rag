@@ -18,7 +18,7 @@ src/
 ├── dependencies.py           # verify_internal_token — all routes except /health require X-Internal-Token
 ├── schemas.py                 # request/response pydantic models
 ├── console_interface.py     # CLI entry point (cyclopts): index-pdf, search, ask/get_answer
-├── settings.py               # env config — read once at import, fails fast (KeyError) if missing
+├── settings.py               # env config — read once at import via os.environ.get, no validation (missing → None)
 ├── langchain_pipeline.py     # PDF → chunks (DoclingLoader + HybridChunker)
 ├── services/
 │   └── rag_service.py        # orchestration: add_texts / search / ask / remove_document
@@ -73,8 +73,8 @@ question ──▶ Voyage query embedding ──▶ Qdrant hybrid search (dense 
   There is no migration path — the schema is fixed at creation time.
 - Point IDs are random `uuid4`s and upserts never dedupe. Re-running `index-pdf` on the same file
   **appends duplicates**; drop the Qdrant collection first for a clean re-index.
-- `VOYAGE_RERANK_MODEL` is the only optional setting — everything else in `settings.py` is
-  `os.environ[...]` and raises `KeyError` at import time if unset.
+- `settings.py` uses `os.environ.get(...)` with no validation: an unset key becomes `None` and only
+  fails at first use (except `ANTHROPIC_MAX_TOKEN`, whose `int(None)` raises `TypeError` at import).
 
 ## Commands
 No test suite, linter, or formatter is configured in this repo (no pytest/ruff/mypy config, no
@@ -83,7 +83,9 @@ No test suite, linter, or formatter is configured in this repo (no pytest/ruff/m
 ```bash
 uv sync                         # install deps
 docker compose up -d            # start local Qdrant (localhost:6333 / gRPC 6334)
-cp .env.example .env            # then fill in ANTHROPIC_API_KEY / VOYAGE_API_KEY
+cp .env.example .env            # then fill in ANTHROPIC_API_KEY / VOYAGE_API_KEY / INTERNAL_SERVICE_TOKEN / ANIMAL_CALLBACK_URL
+
+uv run uvicorn src.main:app --reload --port 8001   # HTTP service for the animal backend (BOOK_RAG_BASE_URL)
 
 uv run python -m src.console_interface index-pdf <path.pdf> --book-title "..." --target-tokens 512
 uv run python -m src.console_interface search "<query>" --top-k 10
@@ -91,7 +93,7 @@ uv run python -m src.console_interface ask "<question>" --top-k 5   # alias: get
 ```
 
 ## Environment
-Required (fail fast on import if missing): `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`,
+Required (not validated — a missing value surfaces as a runtime error at first use): `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`,
 `ANTHROPIC_MAX_TOKEN`, `VOYAGE_API_KEY`, `VOYAGE_MODEL`, `QDRANT_URL`, `QDRANT_COLLECTION`,
 `INTERNAL_SERVICE_TOKEN`, `ANIMAL_CALLBACK_URL`.
 Optional: `VOYAGE_RERANK_MODEL`, `MAX_UPLOAD_SIZE_BYTES` (default 15 MiB). See `.env.example`.

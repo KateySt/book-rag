@@ -52,8 +52,10 @@ cp .env.example .env   # then fill in your keys
 
 ### Environment variables
 
-All variables are required except `VOYAGE_RERANK_MODEL`, and are read once at import time in
-`src/settings.py`. A missing key fails fast with a `KeyError`.
+Variables are read once at import time in `src/settings.py` (loaded from `.env` via `python-dotenv`).
+There is no validation: a missing key becomes `None` and fails later at the first call that needs it
+(a missing `ANTHROPIC_MAX_TOKEN` fails at import with a `TypeError`). The HTTP service also needs
+`INTERNAL_SERVICE_TOKEN` and `ANIMAL_CALLBACK_URL` (see [HTTP service](#http-service-used-by-the-animal-backend)).
 
 | Variable | Description | Example |
 | --- | --- | --- |
@@ -66,7 +68,38 @@ All variables are required except `VOYAGE_RERANK_MODEL`, and are read once at im
 | `QDRANT_URL` | Qdrant endpoint | `http://localhost:6333` |
 | `QDRANT_COLLECTION` | Collection name | `books` |
 
-## Usage
+## HTTP service (used by the `animal` backend)
+
+Chat documents in the `animal` app are parsed, embedded and searched through this service. It is
+internal: every route except `/health` requires the `X-Internal-Token` header.
+
+```bash
+uv run uvicorn src.main:app --reload --port 8001
+```
+
+Extra environment variables for this mode:
+
+| Variable | Description | Example |
+| --- | --- | --- |
+| `INTERNAL_SERVICE_TOKEN` | Shared secret; must equal `INTERNAL_SERVICE_TOKEN` in `animal/.env` | random 32+ chars |
+| `ANIMAL_CALLBACK_URL` | Base URL for status callbacks (`POST {url}/documents/{id}/status`) | `http://localhost:8000/api/v1/internal` |
+| `MAX_UPLOAD_SIZE_BYTES` | Upload limit, optional | `15728640` |
+
+On the `animal` side set `BOOK_RAG_BASE_URL=http://localhost:8001`.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /documents` | Upload a PDF (`chat_session_id`, `document_id`, `filename`, `file`) → `202`, embeds in the background, then calls back with the status |
+| `DELETE /documents/{document_id}` | Remove all chunks of a document |
+| `POST /search` | Hybrid search scoped to one `chat_session_id` |
+| `GET /health` | Liveness check, no auth |
+
+Check that it's up: `curl http://localhost:8001/health`.
+
+> Don't index books with the CLI into the same Qdrant collection the API uses. CLI chunks carry no
+> `chat_session_id`, so they never match API searches and only add noise.
+
+## CLI usage
 
 The CLI is built with [cyclopts](https://cyclopts.readthedocs.io/) and exposed through
 `src/console_interface.py`:
@@ -111,6 +144,10 @@ Aliased as `get_answer`.
 
 ```
 src/
+├── main.py                  # FastAPI app (HTTP service for the animal backend)
+├── documents_router.py      # /documents, /search routes
+├── dependencies.py          # X-Internal-Token check
+├── schemas.py               # request/response models
 ├── console_interface.py     # CLI entry point (cyclopts commands)
 ├── settings.py              # Environment configuration
 ├── langchain_pipeline.py    # PDF → chunks (Docling loader + hybrid chunker)
@@ -118,7 +155,8 @@ src/
 │   └── rag_service.py       # Index / search / ask orchestration
 ├── clients/
 │   ├── claude_client.py     # Anthropic answer generation
-│   └── voyage_client.py     # Embeddings and reranking
+│   ├── voyage_client.py     # Embeddings and reranking
+│   └── callback_client.py   # Status callback to the animal backend (retried)
 └── db/
     └── vector_store.py      # Qdrant collection, upsert, hybrid search
 parsed/                      # Leftover parse artifacts from the earlier MinerU pipeline
