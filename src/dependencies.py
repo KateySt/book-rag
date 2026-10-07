@@ -1,19 +1,25 @@
-from fastapi import File, Form, Header, HTTPException, UploadFile, status
+import secrets
 
-from src.settings import INTERNAL_SERVICE_TOKEN, MAX_UPLOAD_SIZE_BYTES
+from fastapi import Header, HTTPException, Request, status
+
+from src.container import Container
+from src.services.document_service import DocumentService
+from src.services.rag_service import RagService
 
 
-async def verify_internal_token(x_internal_token: str = Header(...)) -> None:
-    if x_internal_token != INTERNAL_SERVICE_TOKEN:
+def get_container(request: Request) -> Container:
+    return request.app.state.container
+
+
+async def verify_internal_token(request: Request, x_internal_token: str = Header(...)) -> None:
+    expected = get_container(request).settings.internal_service_token.get_secret_value().encode()
+    if not secrets.compare_digest(x_internal_token.encode(), expected):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid internal token")
 
 
-async def validate_pdf_upload(filename: str = Form(...), file: UploadFile = File(...)) -> bytes:
-    if not filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="only PDF files are supported")
+def get_document_service(request: Request) -> DocumentService:
+    return get_container(request).documents
 
-    data = await file.read()
-    if len(data) > MAX_UPLOAD_SIZE_BYTES:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="file too large")
 
-    return data
+def get_rag_service(request: Request) -> RagService:
+    return get_container(request).rag
