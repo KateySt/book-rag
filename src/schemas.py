@@ -9,6 +9,10 @@ class EmbedRequest(BaseModel):
     reindex: bool = False
 
 
+class DeleteDocumentsRequest(BaseModel):
+    document_ids: list[str] = Field(min_length=1, max_length=1000)
+
+
 class EmbedAcceptedResponse(BaseModel):
     document_id: str
     status: str

@@ -103,6 +103,7 @@ Every route except `/health` requires the `X-Internal-Token` header.
 | Endpoint | Purpose |
 | --- | --- |
 | `POST /documents` | JSON `{chat_session_id, document_id, filename, object_name, reindex?}` → `202`; checks the object exists in MinIO (`404`) and its size (`413`), queues the job (`503` when the queue is full). Repeating the same request does not queue a second job; `reindex: true` forces a new run |
+| `POST /documents/delete` | JSON `{document_ids: [...]}` (1–1000) — batch delete used by `animal` when a chat, document or user is deleted; marks each document deleted and removes its points in one Qdrant call |
 | `DELETE /documents/{document_id}` | Marks the document deleted (a running job cleans up after itself) and removes its points |
 | `POST /search` | Hybrid search + rerank scoped to one `chat_session_id` |
 | `GET /health` | Redis and Qdrant reachability, no auth |

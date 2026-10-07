@@ -116,6 +116,17 @@ class VectorStore:
             wait=True,
         )
 
+    async def delete_documents(self, document_ids: list[str]) -> None:
+        if not await self._client.collection_exists(self._collection):
+            return
+        await self._client.delete(
+            collection_name=self._collection,
+            points_selector=models.FilterSelector(filter=models.Filter(must=[
+                models.FieldCondition(key="document_id", match=models.MatchAny(any=document_ids)),
+            ])),
+            wait=True,
+        )
+
     async def fetch_chunks(self, document_id: str, run_id: str, chunk_indexes: set[int]) -> list[dict]:
         if not chunk_indexes:
             return []

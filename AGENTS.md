@@ -20,6 +20,8 @@ Anthropic SDK · pydantic-settings · cyclopts · ruff
 - `POST /documents` JSON `{chat_session_id, document_id, filename, object_name, reindex}`; the file is read
   from the private MinIO bucket by a read-only user, never sent in the request. Job id is
   `index:{document_id}` (duplicate requests are no-ops) or `index:{document_id}:{run_id}` when `reindex`.
+- Deletes: `animal` calls `POST /documents/delete` with every affected `document_id` BEFORE deleting its DB rows
+  (chat, document, user). It marks the runs deleted (so an in-flight job won't re-insert points) and is idempotent.
 - Worker calls back `POST {ANIMAL_CALLBACK_URL}/documents/{id}/status`; 404 means the document was deleted
   and is not retried. If a job dies on arq timeout or with the worker, nobody calls back and the document
   stays `embedding` in `animal`.

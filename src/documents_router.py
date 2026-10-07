@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from src.dependencies import get_document_service, get_rag_service, verify_internal_token
 from src.exceptions import ObjectMissingError, ObjectTooLargeError, QueueFullError, UnsupportedFileError
-from src.schemas import EmbedAcceptedResponse, EmbedRequest, SearchChunk, SearchRequest
+from src.schemas import DeleteDocumentsRequest, EmbedAcceptedResponse, EmbedRequest, SearchChunk, SearchRequest
 from src.services.document_service import DocumentService
 from src.services.rag_service import RagService
 
@@ -42,6 +42,14 @@ async def embed_document(
 @router.delete("/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_document(document_id: str, documents: Annotated[DocumentService, Depends(get_document_service)]):
     await documents.delete(document_id)
+
+
+@router.post("/documents/delete", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_documents(
+        payload: DeleteDocumentsRequest,
+        documents: Annotated[DocumentService, Depends(get_document_service)],
+):
+    await documents.delete_many(payload.document_ids)
 
 
 @router.post("/search", response_model=list[SearchChunk])

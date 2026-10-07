@@ -59,5 +59,8 @@ class DocumentService:
             await self._runs.start(document_id, run_id)
 
     async def delete(self, document_id: str) -> None:
-        await self._runs.mark_deleted(document_id)
-        await self._store.delete_points(document_id)
+        await self.delete_many([document_id])
+
+    async def delete_many(self, document_ids: list[str]) -> None:
+        await self._runs.mark_deleted_many(document_ids)
+        await self._store.delete_documents(document_ids)
