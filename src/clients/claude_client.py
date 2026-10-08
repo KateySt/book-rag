@@ -1,23 +1,22 @@
+from string import Template
+
 from anthropic import AsyncAnthropic
 
-from src.settings import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_MAX_TOKEN
 
-anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+class ClaudeClient:
+    def __init__(self, *, api_key: str, model: str, max_tokens: int, answer_prompt: Template) -> None:
+        self._client = AsyncAnthropic(api_key=api_key)
+        self._model = model
+        self._max_tokens = max_tokens
+        self._answer_prompt = answer_prompt
 
+    async def generate_answer(self, question: str, context: str) -> str:
+        message = await self._client.messages.create(
+            model=self._model,
+            max_tokens=self._max_tokens,
+            messages=[{"role": "user", "content": self._answer_prompt.substitute(context=context, question=question)}],
+        )
+        return message.content[0].text
 
-async def generate_answer(question: str, context: str) -> str:
-    message = await anthropic_client.messages.create(
-        model=ANTHROPIC_MODEL,
-        max_tokens=ANTHROPIC_MAX_TOKEN,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Answer the question using ONLY the context below. "
-                    "If the answer isn't in the context, say so.\n\n"
-                    f"Context:\n{context}\n\nQuestion: {question}"
-                ),
-            }
-        ],
-    )
-    return message.content[0].text
+    async def close(self) -> None:
+        await self._client.close()

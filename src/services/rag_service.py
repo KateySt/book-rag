@@ -1,45 +1,52 @@
-from src.clients.claude_client import generate_answer
-from src.db.vector_store import ensure_collection, upsert_documents, search_hybrid
-from src.clients.voyage_client import embed_documents, embed_query, rerank
+from src.clients.claude_client import ClaudeClient
+from src.clients.voyage_client import VoyageClient
+from src.db.vector_store import VectorStore
 
 
-async def add_texts(payloads: list[dict], group_key: str = "chapter") -> list[str]:
-    groups: dict[str, list[dict]] = {}
-    for payload in payloads:
-        groups.setdefault(payload.get(group_key, ""), []).append(payload)
+class RagService:
+    def __init__(
+            self,
+            *,
+            voyage: VoyageClient,
+            store: VectorStore,
+            claude: ClaudeClient,
+            candidates: int = 50,
+    ) -> None:
+        self._voyage = voyage
+        self._store = store
+        self._claude = claude
+        self._candidates = candidates
 
-    ordered = [payload for group in groups.values() for payload in group]
-    documents = [[payload["text"] for payload in group] for group in groups.values()]
+    async def search(self, query: str, *, top_k: int = 10, chat_session_id: str | None = None) -> list[dict]:
+        query_vector = await self._voyage.embed_query(query)
+        results = await self._store.search_hybrid(
+            query,
+            query_vector,
+            top_k=self._candidates,
+            prefetch_limit=self._candidates,
+            chat_session_id=chat_session_id,
+        )
+        if not results:
+            return results
 
-    grouped_vectors = await embed_documents(documents)
-    dense_vectors = [vector for group in grouped_vectors for vector in group]
-    await ensure_collection(vector_size=len(dense_vectors[0]))
+        ranked = await self._voyage.rerank(query, [result["embed_text"] for result in results], top_k=top_k)
+        return [
+            {**results[index], "rank": rank, "score": score}
+            for rank, (index, score) in enumerate(ranked, start=1)
+        ]
 
-    return await upsert_documents(dense_vectors=dense_vectors, payloads=ordered)
+    async def ask(self, question: str, *, top_k: int = 5, chat_session_id: str | None = None) -> tuple[str, list[dict]]:
+        results = await self.search(question, top_k=top_k, chat_session_id=chat_session_id)
+        context = "\n\n---\n\n".join([await self._with_neighbours(result) for result in results])
+        answer = await self._claude.generate_answer(question, context)
+        return answer, results
 
-
-async def search(query: str, top_k: int = 10, candidates: int = 50) -> list[dict]:
-    query_vector = await embed_query(query)
-    results = await search_hybrid(
-        query_text=query,
-        query_vector=query_vector,
-        top_k=candidates,
-        prefetch_limit=candidates,
-    )
-    if not results:
-        return results
-
-    ranked = await rerank(query, [result["text"] for result in results], top_k=top_k)
-    return [
-        {**results[index], "rank": rank, "score": score}
-        for rank, (index, score) in enumerate(ranked, start=1)
-    ]
-
-
-async def ask(question: str, top_k: int = 5) -> tuple[str, list[dict]]:
-    results = await search(question, top_k=top_k)
-    context = "\n\n---\n\n".join(
-        f"{result.get('title', '')}\n{result.get('text', '')}" for result in results
-    )
-    answer = await generate_answer(question, context)
-    return answer, results
+    async def _with_neighbours(self, result: dict) -> str:
+        index = result["chunk_index"]
+        neighbours = await self._store.fetch_chunks(
+            result["document_id"], result["index_run_id"], {index - 1, index + 1}
+        )
+        by_index = {chunk["chunk_index"]: chunk["text"] for chunk in neighbours}
+        by_index[index] = result["text"]
+        body = "\n".join(by_index[i] for i in sorted(by_index))
+        return f"{result.get('title', '')} — {result.get('section_path', '')}\n{body}"

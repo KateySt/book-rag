@@ -7,128 +7,156 @@ sparse vectors, and answers questions with Claude over the retrieved context.
 ## How it works
 
 ```
-PDF ──▶ Docling parse + hybrid chunking ──▶ Voyage contextual embeddings
-                                                        │
-                                                        ▼
+animal ──POST /documents {object_name}──▶ API ──▶ Redis queue ──▶ arq worker
+                                                                     │
+           MinIO (private bucket) ──download──────────────────────────┤
+                                                                     ▼
+       Docling parse (+ auto OCR) ──▶ HybridChunker (Voyage tokenizer, headings in text)
+                                                                     │
+                                                                     ▼
+       groups per chapter ──▶ Voyage contextualized embeddings (batched to API limits)
+                                                                     │
+                                                                     ▼
+       Qdrant: dense (int8 quantized) + server-side BM25 ──▶ callback to animal (ready / failed)
+
 question ──▶ Voyage query embedding ──▶ Qdrant hybrid search (dense + BM25, RRF)
-                                                     │
-                                                     ▼
-                                          Voyage rerank ──▶ Claude ──▶ answer + sources
+                                                 │
+                                                 ▼
+                         Voyage rerank ──▶ (+ neighbour chunks) ──▶ Claude ──▶ answer + sources
 ```
 
-1. **Parsing & chunking** (`src/langchain_pipeline.py`) — [`DoclingLoader`](https://github.com/docling-project/docling)
-   converts the PDF and emits `HybridChunker` chunks that respect the document's own structure and
-   a token budget. Page furniture (headers, footers, footnotes) is dropped. Each chunk carries its
-   `section_path` (heading trail), `chapter` (top heading), `page_start`/`page_end`, `chunk_index`,
-   a coarse `type` (`code` / `table` / `text`) and a `doc_group` used to batch embeddings.
-2. **Embedding** (`src/clients/voyage_client.py`) — Voyage *contextualized* embeddings are used, so
-   chunks are embedded as groups and each vector is aware of its neighbours in the same group.
-3. **Storage & retrieval** (`src/db/vector_store.py`) — Qdrant holds a `dense` vector and a `bm25`
-   sparse vector (via [fastembed](https://github.com/qdrant/fastembed)) per chunk. Search prefetches
-   candidates from both and fuses them with Reciprocal Rank Fusion.
-4. **Reranking & answering** (`src/services/rag_service.py`) — the fused candidates are reranked by
-   Voyage, and the top results are passed to Claude, which is instructed to answer *only* from the
-   provided context.
+1. **Parsing & chunking** (`src/ingestion/chunking.py`) — `DocumentChunker.load_and_chunk(data: bytes, filename)` runs
+   Docling's `DocumentConverter` on an in-memory `DocumentStream` (no temp files). Heading hierarchy is
+   recovered from PDF bookmarks/numbering/fonts. If a PDF has almost no text layer it is re-parsed with
+   OCR. A `PARTIAL_SUCCESS` (e.g. Docling timeout) is treated as a failure, never as a half-indexed book.
+   `HybridChunker` counts tokens with the Voyage tokenizer; page furniture is dropped. Each chunk has
+   `text` (shown to users) and `embed_text` (heading trail + text, used for embeddings, BM25 and rerank).
+2. **Grouping** (`src/ingestion/grouping.py`) — chunks are grouped by chapter (bounded by
+   `GROUP_MIN_TOKENS`/`GROUP_MAX_TOKENS`) because Voyage contextualized embeddings make each vector aware
+   of its group; groups are batched to stay under Voyage request limits (1000 inputs, 16K chunks, 120K tokens).
+3. **Storage** (`src/db/vector_store.py`) — Qdrant `dense` vector (originals on disk, int8 scalar
+   quantization pinned in RAM, rescoring on search) and a `bm25` sparse vector computed by the Qdrant
+   server. Payload indexes: `chat_session_id` (tenant), `document_id`, `index_run_id`, `chunk_index`.
+4. **Versioning** (`src/services/indexing.py`, `src/services/runs.py`) — every indexing run has a
+   `run_id`; point IDs are `uuid5(document_id, run_id, chunk_index)`. New points are written first, then
+   older runs are deleted, so search keeps serving the old version until the new one is complete. A
+   Redis key per document records the current run, which makes re-uploads and deletes during indexing safe.
+5. **Answering** (`src/services/rag_service.py`) — candidates are reranked on `embed_text`; for `ask`,
+   neighbouring chunks (`chunk_index ± 1`) are added to the context sent to Claude.
 
 ## Requirements
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) for dependency management
-- Docker (for the local Qdrant instance)
+- Docker (Qdrant and Redis)
 - API keys for [Anthropic](https://console.anthropic.com/) and [Voyage AI](https://voyageai.com/)
+- For the HTTP service: the `animal` MinIO with the read-only `book-rag` user (created by `minio-init`
+  in `animal/docker/docker-compose.yml`)
 
 ## Setup
 
 ```bash
-# 1. Install dependencies
 uv sync
-
-# 2. Start Qdrant
-docker compose up -d
-
-# 3. Configure environment
-cp .env.example .env   # then fill in your keys
+docker compose up -d          # Qdrant (6333/6334) + Redis for the job queue (6380)
+cp .env.example .env          # then fill in your keys
 ```
+
+The first run downloads Docling layout/table models, the Voyage tokenizer from Hugging Face and (only
+when a scan is detected) OCR models. For offline deploys pre-download them
+(`uv run docling-tools models download`, warm the `HF_HOME` cache).
 
 ### Environment variables
 
-All variables are required except `VOYAGE_RERANK_MODEL`, and are read once at import time in
-`src/settings.py`. A missing key fails fast with a `KeyError`.
+Read by `pydantic-settings` (`src/settings.py`) from the environment / `.env` and validated at start-up.
 
-| Variable | Description | Example |
+| Variable | Description | Default |
 | --- | --- | --- |
-| `ANTHROPIC_API_KEY` | Anthropic API key | `sk-ant-...` |
-| `ANTHROPIC_MODEL` | Model used to generate answers | `claude-sonnet-5` |
-| `ANTHROPIC_MAX_TOKEN` | Max tokens in the generated answer | `1024` |
-| `VOYAGE_API_KEY` | Voyage AI API key | `pa-...` |
-| `VOYAGE_MODEL` | Contextualized embedding model | `voyage-context-3` |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` / `ANTHROPIC_MAX_TOKEN` | Answer generation | required |
+| `VOYAGE_API_KEY` | Voyage AI API key | required |
+| `VOYAGE_MODEL` | Contextualized embedding model | `voyage-context-4` |
 | `VOYAGE_RERANK_MODEL` | Reranking model | `rerank-2.5` |
-| `QDRANT_URL` | Qdrant endpoint | `http://localhost:6333` |
-| `QDRANT_COLLECTION` | Collection name | `books` |
+| `VOYAGE_TOKENIZER` | HF tokenizer used for chunk sizes | `voyageai/voyage-context-4` |
+| `QDRANT_URL` | Qdrant endpoint | required |
+| `QDRANT_COLLECTION` | Collection name | `books_v2` |
+| `BM25_LANGUAGE` | Stemming language for server-side BM25 | `english` |
+| `REDIS_URL` | arq queue + run registry | `redis://localhost:6380/0` |
+| `INTERNAL_SERVICE_TOKEN` | Shared secret with `animal` (API + worker only) | — |
+| `ANIMAL_CALLBACK_URL` | `POST {url}/documents/{id}/status` (worker only) | — |
+| `MINIO_ENDPOINT` / `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | Read-only access to chat documents | `localhost:9000` / — / — |
+| `MINIO_REGION` | Must be set: the read-only user cannot call `GetBucketLocation` | `us-east-1` |
+| `MINIO_DOCUMENTS_BUCKET` / `MINIO_SECURE` | Private documents bucket | `chat-documents` / `false` |
+| `MAX_UPLOAD_SIZE_BYTES` / `MAX_PDF_PAGES` | Input limits | `15728640` / `2000` |
+| `CHUNK_MAX_TOKENS` | Chunk size (one value per collection) | `512` |
+| `JOB_TIMEOUT_SECONDS` / `JOB_MAX_TRIES` | Worker limits | `1800` / `3` |
 
-## Usage
+## HTTP service (used by the `animal` backend)
 
-The CLI is built with [cyclopts](https://cyclopts.readthedocs.io/) and exposed through
-`src/console_interface.py`:
+Two processes:
 
 ```bash
-uv run python -m src.console_interface <command> [OPTIONS]
+uv run uvicorn src.main:app --reload --port 8001   # API
+uv run arq src.worker.WorkerSettings               # indexing worker (one job at a time; scale with more workers)
 ```
 
-### `index-pdf` — parse, chunk and index a book
+Every route except `/health` requires the `X-Internal-Token` header.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /documents` | JSON `{chat_session_id, document_id, filename, object_name, reindex?}` → `202`; checks the object exists in MinIO (`404`) and its size (`413`), queues the job (`503` when the queue is full). Repeating the same request does not queue a second job; `reindex: true` forces a new run |
+| `POST /documents/delete` | JSON `{document_ids: [...]}` (1–1000) — batch delete used by `animal` when a chat, document or user is deleted; marks each document deleted and removes its points in one Qdrant call |
+| `DELETE /documents/{document_id}` | Marks the document deleted (a running job cleans up after itself) and removes its points |
+| `POST /search` | Hybrid search + rerank scoped to one `chat_session_id` |
+| `GET /health` | Redis and Qdrant reachability, no auth |
+
+The worker reports `ready` or `failed` (with a user-readable reason: corrupted / password-protected /
+too many pages / no text / parse failure / service unavailable) to `animal`. Transient errors (network,
+Voyage rate limits, Qdrant) are retried by arq up to `JOB_MAX_TRIES`.
+
+## CLI usage
 
 ```bash
-uv run python -m src.console_interface index-pdf src/data/fastapibook.pdf \
-    --book-title "FastAPI Book" \
-    --target-tokens 512
-```
-
-| Option | Default | Description |
-| --- | --- | --- |
-| `--book-title` | PDF file stem | Stored as `title` on every chunk |
-| `--target-tokens` | `512` | `max_tokens` passed to the Docling `HybridChunker` |
-
-The Qdrant collection is created on first index using the embedding dimensionality returned by
-Voyage.
-
-### `search` — retrieve chunks without generating an answer
-
-```bash
+uv run python -m src.console_interface index-pdf path/to/book.pdf --book-title "FastAPI Book"
 uv run python -m src.console_interface search "how do I add dependencies to a route?" --top-k 10
+uv run python -m src.console_interface ask "What is a FastAPI dependency?" --top-k 5   # alias: get_answer
 ```
 
-Retrieves 50 hybrid candidates, reranks them, and prints the top `--top-k`.
-
-### `ask` — full RAG answer with sources
-
-```bash
-uv run python -m src.console_interface ask "What is a FastAPI dependency?" --top-k 5
-```
-
-Aliased as `get_answer`.
+The CLI indexes directly (no queue, no MinIO) with `document_id = cli:<sha256 prefix>`, so re-indexing
+the same file replaces the previous version. CLI chunks have no `chat_session_id`; CLI `search`/`ask`
+are not tenant-scoped, so keep CLI experiments in a separate `QDRANT_COLLECTION`.
 
 ## Project structure
 
 ```
 src/
-├── console_interface.py     # CLI entry point (cyclopts commands)
-├── settings.py              # Environment configuration
-├── langchain_pipeline.py    # PDF → chunks (Docling loader + hybrid chunker)
+├── main.py                  # FastAPI app: builds the Container in lifespan, closes it on shutdown
+├── worker/                  # arq worker (`uv run arq src.worker.WorkerSettings`)
+│   ├── config.py            # WorkerSettings
+│   ├── lifecycle.py         # startup / shutdown: build and close the Container, warm up Docling
+│   ├── tasks.py             # index_document_job — the function registered in arq
+│   ├── jobs.py              # IndexDocumentJob: run indexing, map errors to callbacks / retries
+│   └── errors.py            # TRANSIENT_ERRORS that are retried
+├── container.py             # Container: builds every client/service lazily from Settings, closes them
+├── exceptions.py            # domain errors (parse, missing/too large object, superseded run, queue full)
+├── documents_router.py      # /documents, /search — maps domain errors to HTTP codes
+├── dependencies.py          # X-Internal-Token check, service dependencies from the Container
+├── schemas.py               # request/response models
+├── console_interface.py     # CLI (cyclopts), uses its own Container
+├── settings.py              # pydantic-settings
+├── prompts/                 # LLM prompts as text files ($placeholders), loaded by load_prompt()
+│   └── answer.md            # answer generation prompt used by `ask`
+├── ingestion/
+│   ├── chunking.py          # DocumentChunker: bytes → chunks (Docling, auto OCR, PDF pre-check)
+│   └── grouping.py          # ChunkGrouper: chapter groups + Voyage request batches
 ├── services/
-│   └── rag_service.py       # Index / search / ask orchestration
+│   ├── document_service.py  # DocumentService: validate + enqueue, delete
+│   ├── indexing.py          # IndexingService: parse → embed → upsert → drop older runs
+│   ├── runs.py              # RunRegistry: current run per document (Redis)
+│   └── rag_service.py       # RagService: search / ask
 ├── clients/
-│   ├── claude_client.py     # Anthropic answer generation
-│   └── voyage_client.py     # Embeddings and reranking
+│   ├── claude_client.py     # ClaudeClient: answer generation
+│   ├── voyage_client.py     # VoyageClient: embeddings and reranking
+│   ├── storage_client.py    # StorageClient: MinIO read-only download
+│   └── callback_client.py   # CallbackClient: status callback to animal (retries 5xx/network only)
 └── db/
-    └── vector_store.py      # Qdrant collection, upsert, hybrid search
-parsed/                      # Leftover parse artifacts from the earlier MinerU pipeline
+    └── vector_store.py      # VectorStore: Qdrant collection, quantization, hybrid search, deletes
 ```
-
-## Notes & caveats
-
-- The first run downloads the Docling and fastembed models, which takes a while and needs disk
-  space; later runs reuse the local model cache.
-- Chunk sizes are enforced by Docling's tokenizer, not Voyage's, so `--target-tokens` is a guide
-  rather than an exact budget for the embedding model.
-- Re-indexing the same book appends new points (IDs are random UUIDs) rather than replacing the old
-  ones — drop the collection first if you want a clean index.
