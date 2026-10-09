@@ -36,6 +36,8 @@ Deployed to Vercel as one project with two services (`vercel.json`, details in R
 - Everything is class-based and wired in `container.Container` (lazy `cached_property` per component, built
   from `Settings`; API and CLI each own one Container and call `close()` on shutdown). Classes get
   their config through the constructor — don't read the global `settings` inside clients/services.
+- `VercelHeadersMiddleware` (`src/main.py`) puts request headers into `vercel.headers.HeadersContext`: on Vercel the
+  Queues SDK takes its OIDC token from `x-vercel-oidc-token`; without it `POST /documents` fails with 503.
 - Prompts live in `src/prompts/*.md` (`string.Template`, `$placeholders`), never inline in code; load them with
   `load_prompt(name)` in the Container and pass them into clients through the constructor.
 - `DocumentChunker.load_and_chunk` takes `bytes`; sync and CPU-heavy — call only via `anyio.to_thread`.
