@@ -22,5 +22,9 @@ class UnsupportedFileError(BookRagError):
     pass
 
 
-class QueueFullError(BookRagError):
+class QueueUnavailableError(BookRagError):
+    pass
+
+
+class TransientIndexError(BookRagError):
     pass

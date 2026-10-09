@@ -4,6 +4,7 @@ from fastapi import Header, HTTPException, Request, status
 
 from src.container import Container
 from src.services.document_service import DocumentService
+from src.services.index_job import IndexJob
 from src.services.rag_service import RagService
 
 
@@ -23,3 +24,7 @@ def get_document_service(request: Request) -> DocumentService:
 
 def get_rag_service(request: Request) -> RagService:
     return get_container(request).rag
+
+
+def get_index_job(request: Request) -> IndexJob:
+    return get_container(request).index_job

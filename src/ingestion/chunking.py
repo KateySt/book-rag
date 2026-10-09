@@ -57,6 +57,10 @@ class DocumentChunker:
         self._converter(do_ocr=False)
         self._hybrid_chunker()
 
+    def prefetch_models(self) -> None:
+        self.warm_up()
+        self._converter(do_ocr=True)
+
     def inspect_pdf(self, data: bytes) -> None:
         try:
             pdf = pdfium.PdfDocument(data)
@@ -116,6 +120,8 @@ class DocumentChunker:
         )
         if result.status is not ConversionStatus.SUCCESS:
             details = "; ".join(error.error_message for error in result.errors) or result.status.value
+            if "timeout" in details.lower():
+                raise DocumentParseError("document is too long to process")
             raise DocumentParseError(f"could not parse PDF: {details}")
         return result.document
 

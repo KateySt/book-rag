@@ -1,12 +1,12 @@
 import logging
 from contextlib import asynccontextmanager
 
-from arq import create_pool
-from arq.connections import RedisSettings
 from fastapi import FastAPI
+from redis.asyncio import Redis
 
 from src.container import Container
 from src.documents_router import router as documents_router
+from src.internal_router import router as internal_router
 from src.settings import settings
 
 
@@ -14,8 +14,9 @@ from src.settings import settings
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO)
     settings.require_service_settings()
-    redis = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+    redis = Redis.from_url(settings.redis_url)
     app.state.container = Container(settings, redis=redis)
+    app.state.container.index_queue
     try:
         yield
     finally:
@@ -25,3 +26,4 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="books-rag", lifespan=lifespan)
 app.include_router(documents_router)
+app.include_router(internal_router)

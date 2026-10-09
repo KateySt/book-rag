@@ -9,6 +9,18 @@ class EmbedRequest(BaseModel):
     reindex: bool = False
 
 
+class IndexJobMessage(BaseModel):
+    object_name: str
+    filename: str
+    document_id: str
+    run_id: str
+    chat_session_id: str
+
+
+class IndexJobRequest(IndexJobMessage):
+    attempt: int = Field(ge=1)
+
+
 class DeleteDocumentsRequest(BaseModel):
     document_ids: list[str] = Field(min_length=1, max_length=1000)
 

@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from src.dependencies import get_document_service, get_rag_service, verify_internal_token
-from src.exceptions import ObjectMissingError, ObjectTooLargeError, QueueFullError, UnsupportedFileError
+from src.exceptions import ObjectMissingError, ObjectTooLargeError, QueueUnavailableError, UnsupportedFileError
 from src.schemas import DeleteDocumentsRequest, EmbedAcceptedResponse, EmbedRequest, SearchChunk, SearchRequest
 from src.services.document_service import DocumentService
 from src.services.rag_service import RagService
@@ -30,10 +30,10 @@ async def embed_document(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="object not found")
     except ObjectTooLargeError:
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="file too large")
-    except QueueFullError:
+    except QueueUnavailableError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="indexing queue is full",
+            detail="indexing queue is unavailable",
             headers={"Retry-After": "60"},
         )
     return EmbedAcceptedResponse(document_id=payload.document_id, status="embedding")

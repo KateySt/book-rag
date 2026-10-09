@@ -7,8 +7,8 @@ UPSERT_BATCH = 256
 
 
 class VectorStore:
-    def __init__(self, *, url: str, collection: str, bm25_language: str) -> None:
-        self._client = AsyncQdrantClient(url=url)
+    def __init__(self, *, url: str, api_key: str | None, collection: str, bm25_language: str) -> None:
+        self._client = AsyncQdrantClient(url=url, api_key=api_key)
         self._collection = collection
         self._bm25_language = bm25_language
 

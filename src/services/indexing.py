@@ -39,7 +39,7 @@ class IndexingService:
             chat_session_id: str | None,
     ) -> int:
         await to_thread.run_sync(self._chunker.inspect_pdf, data)
-        chunks = await to_thread.run_sync(self._chunker.load_and_chunk, data, filename)
+        chunks = await to_thread.run_sync(self._chunker.load_and_chunk, data, filename, abandon_on_cancel=True)
         if not chunks:
             raise DocumentParseError("no text extracted from PDF")
 

@@ -4,8 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 SERVICE_SETTINGS = (
     "internal_service_token",
     "animal_callback_url",
-    "minio_access_key",
-    "minio_secret_key",
+    "blob_documents_read_write_token",
 )
 
 
@@ -22,24 +21,21 @@ class Settings(BaseSettings):
     voyage_tokenizer: str = "voyageai/voyage-context-4"
 
     qdrant_url: str
+    qdrant_api_key: SecretStr | None = None
     qdrant_collection: str = "books_v2"
     bm25_language: str = "english"
 
     redis_url: str = "redis://localhost:6380/0"
+    index_queue_topic: str = "book-rag-index"
+    queue_region: str = "fra1"
 
     internal_service_token: SecretStr | None = None
     animal_callback_url: str | None = None
 
-    minio_endpoint: str = "localhost:9000"
-    minio_region: str = "us-east-1"
-    minio_access_key: SecretStr | None = None
-    minio_secret_key: SecretStr | None = None
-    minio_documents_bucket: str = "chat-documents"
-    minio_secure: bool = False
+    blob_documents_read_write_token: SecretStr | None = None
 
     max_upload_size_bytes: int = 15 * 1024 * 1024
     max_pdf_pages: int = 2000
-    max_queued_jobs: int = 200
 
     chunk_max_tokens: int = 512
     group_min_tokens: int = 4_000
@@ -49,8 +45,9 @@ class Settings(BaseSettings):
     docling_document_timeout: float = 900
     ocr_min_chars_per_page: int = 100
 
-    job_timeout_seconds: int = 1800
     job_max_tries: int = 3
+    index_timeout_seconds: float = 230
+    index_lock_timeout_seconds: float = 5
 
     def require_service_settings(self) -> None:
         missing = [name.upper() for name in SERVICE_SETTINGS if getattr(self, name) is None]

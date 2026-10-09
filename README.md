@@ -7,9 +7,9 @@ sparse vectors, and answers questions with Claude over the retrieved context.
 ## How it works
 
 ```
-animal ──POST /documents {object_name}──▶ API ──▶ Redis queue ──▶ arq worker
+animal ──POST /documents {object_name}──▶ API ──▶ Vercel Queues ──▶ jobs relay ──▶ POST /internal/index
                                                                      │
-           MinIO (private bucket) ──download──────────────────────────┤
+      Vercel Blob (private store) ──download──────────────────────────┤
                                                                      ▼
        Docling parse (+ auto OCR) ──▶ HybridChunker (Voyage tokenizer, headings in text)
                                                                      │
@@ -50,20 +50,20 @@ question ──▶ Voyage query embedding ──▶ Qdrant hybrid search (dense 
 - [uv](https://docs.astral.sh/uv/) for dependency management
 - Docker (Qdrant and Redis)
 - API keys for [Anthropic](https://console.anthropic.com/) and [Voyage AI](https://voyageai.com/)
-- For the HTTP service: the `animal` MinIO with the read-only `book-rag` user (created by `minio-init`
-  in `animal/docker/docker-compose.yml`)
+- For the HTTP service: the token of `animal`'s private Vercel Blob store with chat PDFs
+  (`BLOB_DOCUMENTS_READ_WRITE_TOKEN`, same value as in `animal/.env`)
 
 ## Setup
 
 ```bash
 uv sync
-docker compose up -d          # Qdrant (6333/6334) + Redis for the job queue (6380)
+docker compose up -d          # Qdrant (6333/6334) + Redis for the run registry (6380)
 cp .env.example .env          # then fill in your keys
 ```
 
 The first run downloads Docling layout/table models, the Voyage tokenizer from Hugging Face and (only
-when a scan is detected) OCR models. For offline deploys pre-download them
-(`uv run docling-tools models download`, warm the `HF_HOME` cache).
+when a scan is detected) OCR models. The Docker image (`Dockerfile.vercel`) bakes all of them in at build
+time with `python -m src.ingestion.prefetch` and runs with `HF_HUB_OFFLINE=1`.
 
 ### Environment variables
 
@@ -77,40 +77,87 @@ Read by `pydantic-settings` (`src/settings.py`) from the environment / `.env` an
 | `VOYAGE_RERANK_MODEL` | Reranking model | `rerank-2.5` |
 | `VOYAGE_TOKENIZER` | HF tokenizer used for chunk sizes | `voyageai/voyage-context-4` |
 | `QDRANT_URL` | Qdrant endpoint | required |
+| `QDRANT_API_KEY` | Qdrant Cloud API key (empty for local Qdrant) | — |
 | `QDRANT_COLLECTION` | Collection name | `books_v2` |
 | `BM25_LANGUAGE` | Stemming language for server-side BM25 | `english` |
-| `REDIS_URL` | arq queue + run registry | `redis://localhost:6380/0` |
-| `INTERNAL_SERVICE_TOKEN` | Shared secret with `animal` (API + worker only) | — |
-| `ANIMAL_CALLBACK_URL` | `POST {url}/documents/{id}/status` (worker only) | — |
-| `MINIO_ENDPOINT` / `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | Read-only access to chat documents | `localhost:9000` / — / — |
-| `MINIO_REGION` | Must be set: the read-only user cannot call `GetBucketLocation` | `us-east-1` |
-| `MINIO_DOCUMENTS_BUCKET` / `MINIO_SECURE` | Private documents bucket | `chat-documents` / `false` |
+| `REDIS_URL` | Run registry (current run per document) | `redis://localhost:6380/0` |
+| `INDEX_QUEUE_TOPIC` | Vercel Queues topic for indexing jobs | `book-rag-index` |
+| `QUEUE_REGION` | Vercel Queues region the api publishes to; must match `regions` in `vercel.json` | `fra1` |
+| `INTERNAL_SERVICE_TOKEN` | Shared secret with `animal` and the `jobs` relay | — |
+| `ANIMAL_CALLBACK_URL` | `POST {url}/documents/{id}/status`, must be reachable from Vercel | — |
+| `BLOB_DOCUMENTS_READ_WRITE_TOKEN` | Private Vercel Blob store with chat documents (same as in `animal/.env`); `object_name` is the blob pathname | — |
 | `MAX_UPLOAD_SIZE_BYTES` / `MAX_PDF_PAGES` | Input limits | `15728640` / `2000` |
 | `CHUNK_MAX_TOKENS` | Chunk size (one value per collection) | `512` |
-| `JOB_TIMEOUT_SECONDS` / `JOB_MAX_TRIES` | Worker limits | `1800` / `3` |
+| `DOCLING_DOCUMENT_TIMEOUT` | Docling parse budget per document, seconds | `900` (`.env.example`: `200`) |
+| `JOB_MAX_TRIES` | Attempts for transient errors before `failed` | `3` |
+| `INDEX_TIMEOUT_SECONDS` | Whole indexing run budget; past it the document is `failed` | `230` |
+| `INDEX_LOCK_TIMEOUT_SECONDS` | How long `/internal/index` waits for the run already in progress, then `503` + `Retry-After` | `5` |
+| `VERCEL_REGION` / `VERCEL_QUEUE_TOKEN` / `VERCEL_QUEUE_BASE_URL` | Local queue devserver and `jobs/poll.py` only (`fra1` / `vc-dev-token` / printed `baseUrl`); Vercel sets them in the cloud | — |
 
 ## HTTP service (used by the `animal` backend)
 
-Two processes:
+Locally three processes (plus `docker compose up -d`):
 
 ```bash
-uv run uvicorn src.main:app --reload --port 8001   # API
-uv run arq src.worker.WorkerSettings               # indexing worker (one job at a time; scale with more workers)
+uv run python -m vercel.queue.devserver            # local Vercel Queues; put the printed baseUrl in VERCEL_QUEUE_BASE_URL
+uv run --env-file .env uvicorn src.main:app --reload --port 8001   # API, also runs indexing in POST /internal/index
+cd jobs && BOOK_RAG_API_URL=http://localhost:8001 uv run --project .. --env-file ../.env python poll.py   # relay
 ```
+
+On Vercel there is no worker process: Vercel Queues pushes each message to the `jobs` service, which calls
+`POST /internal/index` on the `api` container over a service binding (see "Deploy to Vercel").
 
 Every route except `/health` requires the `X-Internal-Token` header.
 
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /documents` | JSON `{chat_session_id, document_id, filename, object_name, reindex?}` → `202`; checks the object exists in MinIO (`404`) and its size (`413`), queues the job (`503` when the queue is full). Repeating the same request does not queue a second job; `reindex: true` forces a new run |
+| `POST /documents` | JSON `{chat_session_id, document_id, filename, object_name, reindex?}` → `202`; checks the object exists in Vercel Blob (`404`) and its size (`413`), publishes the job to Vercel Queues (`503` when the queue is unavailable). Repeating the same request does not queue a second job; `reindex: true` forces a new run |
 | `POST /documents/delete` | JSON `{document_ids: [...]}` (1–1000) — batch delete used by `animal` when a chat, document or user is deleted; marks each document deleted and removes its points in one Qdrant call |
 | `DELETE /documents/{document_id}` | Marks the document deleted (a running job cleans up after itself) and removes its points |
 | `POST /search` | Hybrid search + rerank scoped to one `chat_session_id` |
+| `POST /internal/index` | Called only by the `jobs` relay: one indexing run per queue delivery; `204`, or `503` + `Retry-After` on transient errors |
 | `GET /health` | Redis and Qdrant reachability, no auth |
 
-The worker reports `ready` or `failed` (with a user-readable reason: corrupted / password-protected /
+Indexing reports `ready` or `failed` (with a user-readable reason: corrupted / password-protected /
 too many pages / no text / parse failure / service unavailable) to `animal`. Transient errors (network,
-Voyage rate limits, Qdrant) are retried by arq up to `JOB_MAX_TRIES`.
+Voyage rate limits, Qdrant) return `503`; the relay re-queues the message with that delay, up to
+`JOB_MAX_TRIES` attempts (the queue itself stops after 5 deliveries). Delivery is at-least-once, so one
+`run_id` may be indexed twice; that is safe because point ids are derived from `run_id`.
+
+## Deploy to Vercel
+
+One Vercel project with root `book-rag/` and two services (`vercel.json`):
+
+- `api` — `Dockerfile.vercel` (Container Images): FastAPI with every route above, public via the rewrite.
+- `jobs` — `jobs/consumer.py`, a Vercel Queues push subscriber (consumer group `book-rag-index-relay`,
+  `maxDuration` 300 s in `vercel.json`; `[[tool.vercel.subscribers]]` in
+  `jobs/pyproject.toml`); it reaches `api` through the `BOOK_RAG_API_URL` binding and is not public.
+
+Functions run in `fra1`; keep Qdrant Cloud, Upstash Redis and the Blob store in Frankfurt too.
+Hobby limits shape the settings: 2 GB RAM / 1 vCPU and 300 s per request, so indexing must finish well
+under 300 s (the relay gives up at 280 s and the message is retried). Measured with 1 vCPU / 2 GB: a 1-page
+PDF takes about 19 s including model loading (1.1 GB peak), 20 pages take about 200–230 s and reach 1.9–2.2 GB,
+so `MAX_PDF_PAGES=5`. One indexing run at a time per container (lock + `max_concurrency=1` on the subscriber; a second request
+waits at most `INDEX_LOCK_TIMEOUT_SECONDS`, then gets `503` and the relay retries it later);
+past `INDEX_TIMEOUT_SECONDS` the document is reported `failed` ("document is too long to process").
+
+Environment variables in the Vercel project:
+
+| Service | Variables |
+| --- | --- |
+| `api` | everything from `.env.example` except the local queue block; `QDRANT_URL` + `QDRANT_API_KEY` from Qdrant Cloud, `REDIS_URL=rediss://…` from Upstash, `MAX_PDF_PAGES=5`, `DOCLING_DOCUMENT_TIMEOUT=100`, `INDEX_TIMEOUT_SECONDS=230` |
+| `jobs` | `INTERNAL_SERVICE_TOKEN` |
+
+In `animal`: `BOOK_RAG_BASE_URL=https://<project>.vercel.app`, `BOOK_RAG_REQUEST_TIMEOUT_SECONDS=60`
+(the first request after idle starts the container). `ANIMAL_CALLBACK_URL` in book-rag must point at
+animal's public URL + `/api/v1/internal`. Hobby is for non-commercial use only.
+
+Timeouts must nest: `INDEX_LOCK_TIMEOUT_SECONDS` (5) + `INDEX_TIMEOUT_SECONDS` (230) + status callback retries
+(≤ 40 s) < relay HTTP timeout (280 s, `jobs/consumer.py`) < `jobs` `maxDuration` (300 s). Change them together.
+
+Queue messages are pinned to the deployment that sent them: promote or rollback does not stop an old
+deployment from retrying its own messages until they are acked or expire. Remove stale deployments
+(`vercel remove <deployment-url>`) to stop them.
 
 ## CLI usage
 
@@ -120,7 +167,7 @@ uv run python -m src.console_interface search "how do I add dependencies to a ro
 uv run python -m src.console_interface ask "What is a FastAPI dependency?" --top-k 5   # alias: get_answer
 ```
 
-The CLI indexes directly (no queue, no MinIO) with `document_id = cli:<sha256 prefix>`, so re-indexing
+The CLI indexes directly (no queue, no Vercel Blob) with `document_id = cli:<sha256 prefix>`, so re-indexing
 the same file replaces the previous version. CLI chunks have no `chat_session_id`; CLI `search`/`ask`
 are not tenant-scoped, so keep CLI experiments in a separate `QDRANT_COLLECTION`.
 
@@ -129,15 +176,10 @@ are not tenant-scoped, so keep CLI experiments in a separate `QDRANT_COLLECTION`
 ```
 src/
 ├── main.py                  # FastAPI app: builds the Container in lifespan, closes it on shutdown
-├── worker/                  # arq worker (`uv run arq src.worker.WorkerSettings`)
-│   ├── config.py            # WorkerSettings
-│   ├── lifecycle.py         # startup / shutdown: build and close the Container, warm up Docling
-│   ├── tasks.py             # index_document_job — the function registered in arq
-│   ├── jobs.py              # IndexDocumentJob: run indexing, map errors to callbacks / retries
-│   └── errors.py            # TRANSIENT_ERRORS that are retried
 ├── container.py             # Container: builds every client/service lazily from Settings, closes them
-├── exceptions.py            # domain errors (parse, missing/too large object, superseded run, queue full)
+├── exceptions.py            # domain errors (parse, missing/too large object, superseded run, queue unavailable, transient)
 ├── documents_router.py      # /documents, /search — maps domain errors to HTTP codes
+├── internal_router.py       # /internal/index — one indexing run per queue delivery
 ├── dependencies.py          # X-Internal-Token check, service dependencies from the Container
 ├── schemas.py               # request/response models
 ├── console_interface.py     # CLI (cyclopts), uses its own Container
@@ -146,17 +188,23 @@ src/
 │   └── answer.md            # answer generation prompt used by `ask`
 ├── ingestion/
 │   ├── chunking.py          # DocumentChunker: bytes → chunks (Docling, auto OCR, PDF pre-check)
+│   ├── prefetch.py          # build-time model download for the Docker image
 │   └── grouping.py          # ChunkGrouper: chapter groups + Voyage request batches
 ├── services/
-│   ├── document_service.py  # DocumentService: validate + enqueue, delete
+│   ├── document_service.py  # DocumentService: validate, claim run, publish to the queue; delete
+│   ├── index_job.py         # IndexJob: download → index → callback; transient errors → retry
 │   ├── indexing.py          # IndexingService: parse → embed → upsert → drop older runs
 │   ├── runs.py              # RunRegistry: current run per document (Redis)
 │   └── rag_service.py       # RagService: search / ask
 ├── clients/
 │   ├── claude_client.py     # ClaudeClient: answer generation
+│   ├── index_queue.py       # IndexQueue: publish indexing jobs to Vercel Queues
 │   ├── voyage_client.py     # VoyageClient: embeddings and reranking
-│   ├── storage_client.py    # StorageClient: MinIO read-only download
+│   ├── storage_client.py    # StorageClient: Vercel Blob (private store) download
 │   └── callback_client.py   # CallbackClient: status callback to animal (retries 5xx/network only)
 └── db/
     └── vector_store.py      # VectorStore: Qdrant collection, quantization, hybrid search, deletes
+jobs/                        # separate Vercel service: queue subscriber relay (+ poll.py for local dev)
+Dockerfile.vercel            # api container image (CPU torch, models baked in)
+vercel.json                  # services api + jobs, binding, region
 ```

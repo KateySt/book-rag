@@ -1,0 +1,18 @@
+{
+  "regions": ["fra1"],
+  "services": {
+    "api": {
+      "root": "./",
+      "runtime": "container",
+      "entrypoint": "Dockerfile.vercel"
+    },
+    "jobs": {
+      "root": "jobs/",
+      "functions": { "consumer.py": { "maxDuration": 300 } },
+      "bindings": [
+        { "type": "service", "service": "api", "format": "url", "env": "BOOK_RAG_API_URL" }
+      ]
+    }
+  },
+  "rewrites": [{ "source": "/(.*)", "destination": { "service": "api" } }]
+}
