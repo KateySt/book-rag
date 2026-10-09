@@ -130,7 +130,7 @@ One Vercel project with root `book-rag/` and two services (`vercel.json`):
 
 - `api` — `Dockerfile.vercel` (Container Images): FastAPI with every route above, public via the rewrite.
 - `jobs` — `jobs/consumer.py`, a Vercel Queues push subscriber (consumer group `book-rag-index-relay`,
-  `maxDuration` 300 s in `vercel.json`; `[[tool.vercel.subscribers]]` in
+  `"entrypoint": "pyproject.toml"` in `vercel.json`; `[[tool.vercel.subscribers]]` in
   `jobs/pyproject.toml`); it reaches `api` through the `BOOK_RAG_API_URL` binding and is not public.
 
 Functions run in `fra1`; keep Qdrant Cloud, Upstash Redis and the Blob store in Frankfurt too.
@@ -153,7 +153,7 @@ In `animal`: `BOOK_RAG_BASE_URL=https://<project>.vercel.app`, `BOOK_RAG_REQUEST
 animal's public URL + `/api/v1/internal`. Hobby is for non-commercial use only.
 
 Timeouts must nest: `INDEX_LOCK_TIMEOUT_SECONDS` (5) + `INDEX_TIMEOUT_SECONDS` (230) + status callback retries
-(≤ 40 s) < relay HTTP timeout (280 s, `jobs/consumer.py`) < `jobs` `maxDuration` (300 s). Change them together.
+(≤ 40 s) < relay HTTP timeout (280 s, `jobs/consumer.py`) < function `maxDuration` (300 s, the Hobby default and maximum). Change them together.
 
 Queue messages are pinned to the deployment that sent them: promote or rollback does not stop an old
 deployment from retrying its own messages until they are acked or expire. Remove stale deployments

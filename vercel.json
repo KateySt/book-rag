@@ -8,7 +8,7 @@
     },
     "jobs": {
       "root": "jobs/",
-      "functions": { "consumer.py": { "maxDuration": 300 } },
+      "entrypoint": "pyproject.toml",
       "bindings": [
         { "type": "service", "service": "api", "format": "url", "env": "BOOK_RAG_API_URL" }
       ]
